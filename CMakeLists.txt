@@ -22,7 +22,7 @@ if(NOT CMAKE_BUILD_TARGET)
 endif()
 
 option(BUILD_EXAMPLE "Build example program" ON)
-option(BUILD_TEST "Build test program" OFF)
+option(BUILD_TEST "Build test program" ON)
 option(ENABLE_UVC_DEBUGGING "Enable UVC debugging" OFF)
 
 set(libuvc_DESCRIPTION "A cross-platform library for USB video devices")
@@ -156,11 +156,8 @@ endif()
 if(BUILD_TEST)
   # OpenCV defines targets with transitive dependencies not with namespaces but using opencv_ prefix. 
   # This targets provide necessary include directories and linked flags.
-  find_package(OpenCVPkg REQUIRED
-    COMPONENTS
-      opencv_core
-      opencv_highgui
-  )
+  # find_package(OpenCV 4 REQUIRED
+  # )
 
   add_executable(uvc_test src/test.c)
   target_link_libraries(uvc_test
