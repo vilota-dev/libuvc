@@ -36,77 +36,149 @@
 #include "libuvc/libuvc.h"
 #include <stdint.h>
 #include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <string.h>
+#include <signal.h>
 
+#define PORT 8080
 
+static int server_fd = -1;
+static int client_fd = -1;
+static uint8_t *latest_frame = NULL;
+static size_t latest_frame_size = 0;
+static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uvc_device_handle_t *g_devh = NULL;
+// Stream thread
+void *stream_thread(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&frame_mutex);
+        if (client_fd > 0 && latest_frame && latest_frame_size > 0) {
+            char part[256];
+            int n = snprintf(part, sizeof(part),
+                             "--frame\r\n"
+                             "Content-Type: image/jpeg\r\n"
+                             "Content-Length: %zu\r\n\r\n",
+                             latest_frame_size);
+            send(client_fd, part, n, 0);
+            send(client_fd, latest_frame, latest_frame_size, 0);
+            send(client_fd, "\r\n", 2, 0);
+        }
+        pthread_mutex_unlock(&frame_mutex);
+        usleep(33000); // ~30 FPS
+    }
+    return NULL;
+}
+
+// Start HTTP MJPEG server
+void start_server() {
+    struct sockaddr_in addr;
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return; }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return; }
+    listen(server_fd, 1);
+
+    printf("Waiting for client on http://localhost:%d\n", PORT);
+    client_fd = accept(server_fd, NULL, NULL);
+    if (client_fd < 0) { perror("accept"); return; }
+
+    const char *header =
+        "HTTP/1.0 200 OK\r\n"
+        "Connection: close\r\n"
+        "Max-Age: 0\r\n"
+        "Expires: 0\r\n"
+        "Cache-Control: no-cache, private\r\n"
+        "Pragma: no-cache\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+    send(client_fd, header, strlen(header), 0);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, stream_thread, NULL);
+}
+
+// Libuvc callback
 void cb(uvc_frame_t *frame, void *ptr) {
-  uvc_frame_t *bgr;
+    static uint64_t total_frames = 0;
+    static uint64_t window_frames = 0;
+    static int initialized = 0;
+    static struct timeval start_tv, last_tv;
+    static int server_started = 0;
 
-  static uint64_t total_frames = 0;
-  static uint64_t window_frames = 0;
-  static int initialized = 0;
-  static struct timeval start_tv;
-  static struct timeval last_tv;
+    struct timeval now;
+    double total_elapsed, window_elapsed, fps_avg, fps_inst;
 
-  struct timeval now;
-  double total_elapsed;
-  double window_elapsed;
-  double fps_avg;
-  double fps_inst;
+    if (!initialized) {
+        gettimeofday(&start_tv, NULL);
+        last_tv = start_tv;
+        initialized = 1;
+        return;
+    }
 
-  if (!initialized) {
-    gettimeofday(&start_tv, NULL);
-    last_tv = start_tv;
-    initialized = 1;
-    return;
-  }
+    gettimeofday(&now, NULL);
+    total_frames++;
+    window_frames++;
 
-  gettimeofday(&now, NULL);
+    total_elapsed = (double)(now.tv_sec - start_tv.tv_sec) + 
+                    (double)(now.tv_usec - start_tv.tv_usec)/1000000.0;
+    window_elapsed = (double)(now.tv_sec - last_tv.tv_sec) + 
+                     (double)(now.tv_usec - last_tv.tv_usec)/1000000.0;
 
-  total_frames++;
-  window_frames++;
+    fps_avg = total_elapsed > 0 ? total_frames / total_elapsed : 0.0;
+    fps_inst = window_elapsed > 0 ? window_frames / window_elapsed : 0.0;
 
-  total_elapsed =
-      (double)(now.tv_sec - start_tv.tv_sec) +
-      (double)(now.tv_usec - start_tv.tv_usec) / 1000000.0;
+//    printf("%llu: callback! length = %u, ptr=%p\n", 
+ //          (unsigned long long)total_frames, (unsigned)frame->data_bytes, ptr);
+ //   printf("width=%u, height=%u\n", frame->width, frame->height);
+  //  printf("format=%d, size=%zu\n", frame->frame_format, frame->data_bytes);
 
-  window_elapsed =
-      (double)(now.tv_sec - last_tv.tv_sec) +
-      (double)(now.tv_usec - last_tv.tv_usec) / 1000000.0;
+    if (window_elapsed >= 1.0) {
+    //    printf("FPS(inst)=%.2f, FPS(avg)=%.2f\n", fps_inst, fps_avg);
+        last_tv = now;
+        window_frames = 0;
+    }
 
-  fps_avg = (total_elapsed > 0.0) ? ((double)total_frames / total_elapsed) : 0.0;
-  fps_inst = (window_elapsed > 0.0) ? ((double)window_frames / window_elapsed) : 0.0;
+    // Start server once
+    if (!server_started) {
+        server_started = 1;
+        start_server();
+    }
 
-  printf("%llu: callback! length = %u, ptr = %p\n",
-         (unsigned long long)total_frames,
-         (unsigned)frame->data_bytes,
-         ptr);
-  printf("width %u, height %u\n",
-         (unsigned)frame->width,
-         (unsigned)frame->height);
+    // Copy frame to latest_frame buffer
+    pthread_mutex_lock(&frame_mutex);
+    free(latest_frame);
+    latest_frame = malloc(frame->data_bytes);
+    if (latest_frame) {
+        memcpy(latest_frame, frame->data, frame->data_bytes);
+        latest_frame_size = frame->data_bytes;
+    } else {
+        latest_frame_size = 0;
+    }
+    pthread_mutex_unlock(&frame_mutex);
+}
 
-  // Print FPS once per second to avoid spamming too much
-  if (window_elapsed >= 1.0) {
-    printf("FPS(inst)=%.2f, FPS(avg)=%.2f\n", fps_inst, fps_avg);
-    last_tv = now;
-    window_frames = 0;
-  }
-
-  bgr = uvc_allocate_frame(frame->width * frame->height * 3);
-  if (!bgr) {
-    printf("unable to allocate bgr frame!\n");
-    return;
-  }
-
-  // ret = uvc_any2bgr(frame, bgr);
-  // if (ret) {
-  //   uvc_perror(ret, "uvc_any2bgr");
-  //   uvc_free_frame(bgr);
-  //   return;
-  // }
-
-  // cvWaitKey(10);
-
-  uvc_free_frame(bgr);
+void sigint_handler(int sig) {
+    if (g_devh) {
+        uvc_stop_streaming(g_devh);
+        puts("Streaming stopped by Ctrl+C");
+    }
+    uvc_close(g_devh);
+    exit(0);
 }
 
 int main(int argc, char **argv) {
@@ -116,6 +188,7 @@ int main(int argc, char **argv) {
   uvc_device_handle_t *devh;
   uvc_stream_ctrl_t ctrl;
 
+  signal(SIGINT,sigint_handler);
   res = uvc_init(&ctx, NULL);
 
   if (res < 0) {
@@ -155,29 +228,17 @@ int main(int argc, char **argv) {
       if (res < 0) {
         uvc_perror(res, "get_mode");
       } else {
+        g_devh=devh;
         res = uvc_start_streaming(devh, &ctrl, cb, 12345, 0);
 
         if (res < 0) {
           uvc_perror(res, "start_streaming");
-        } else {
-          puts("Streaming for 10 seconds...");
-          // uvc_error_t resAEMODE = uvc_set_ae_mode(devh, 1);
-          // uvc_perror(resAEMODE, "set_ae_mode");
-          int i;
-          for (i = 1; i <= 10; i++) {
-            /* uvc_error_t resPT = uvc_set_pantilt_abs(devh, i * 20 * 3600, 0); */
-            /* uvc_perror(resPT, "set_pt_abs"); */
-            // uvc_error_t resEXP = uvc_set_exposure_abs(devh, 20 + i * 5);
-            // uvc_perror(resEXP, "set_exp_abs");
-            
-            sleep(1);
-          }
-          sleep(10);
-          uvc_stop_streaming(devh);
-	  puts("Done streaming.");
         }
-      }
+        else{
+          puts("Streaming... Press Ctrl+C to stop.");
 
+          while (1) sleep(1); // keep program alive
+        }
       uvc_close(devh);
       puts("Device closed");
     }
@@ -189,5 +250,6 @@ int main(int argc, char **argv) {
   puts("UVC exited");
 
   return 0;
+  }
 }
 
